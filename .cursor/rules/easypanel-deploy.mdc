@@ -1,0 +1,14 @@
+---
+description: Após push no Git, disparar deploy no Easypanel
+alwaysApply: true
+---
+
+# Deploy Easypanel após Git
+
+Quando uma tarefa incluir **commit e push** para este repositório e o push terminar **com sucesso**, execute logo em seguida na raiz do projeto:
+
+```bash
+npm run deploy:easypanel
+```
+
+Isso aciona o webhook de deploy do Easypanel. Não omitir este passo após pushes concluídos com sucesso.
