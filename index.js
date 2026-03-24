@@ -2,15 +2,26 @@ const { Client } = require('whatsapp-web.js');
 const axios = require('axios');
 const qrcode = require('qrcode-terminal');
 
+console.log('Iniciando conexão com o Chrome em:', process.env.CHROME_URL);
+
 const client = new Client({
     puppeteer: {
-        browserWSEndpoint: process.env.CHROME_URL, // URL do Browseless
+        browserWSEndpoint: process.env.CHROME_URL,
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-extensions',
+            '--disable-dev-shm-usage' // Importante para containers
+        ]
     }
 });
 
-// Exibe o QR Code no log do Easypanel para você escanear
+// Tratamento de erro global para evitar que o app feche
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('⚠️ Erro não tratado:', reason);
+});
+
 client.on('qr', (qr) => {
     console.log('--- ESCANEIE O QR CODE ABAIXO ---');
     qrcode.generate(qr, { small: true });
@@ -18,6 +29,10 @@ client.on('qr', (qr) => {
 
 client.on('ready', () => {
     console.log('✅ WhatsApp Conectado!');
+});
+
+client.on('auth_failure', msg => {
+    console.error('❌ Falha na autenticação:', msg);
 });
 
 // Envia para o n8n
@@ -38,4 +53,6 @@ client.on('message', async (msg) => {
     }
 });
 
-client.initialize();
+client.initialize().catch(err => {
+    console.error('❌ Falha ao inicializar o cliente:', err);
+});
