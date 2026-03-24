@@ -17,7 +17,29 @@ const { Client } = require('whatsapp-web.js');
 const axios = require('axios');
 const qrcode = require('qrcode-terminal');
 
+const STARTUP_WAIT_MS = Math.max(0, parseInt(process.env.STARTUP_WAIT_MS || '0', 10) || 0);
+const CHROME_RECONNECT_MS = Math.max(3000, parseInt(process.env.CHROME_RECONNECT_MS || '15000', 10) || 15000);
+
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+
+function explainInitError(err) {
+    const msg = err?.message || String(err);
+    console.error('❌ Falha ao inicializar o cliente:', msg);
+    if (/ECONNREFUSED/i.test(msg)) {
+        console.error(`→ ECONNREFUSED: ninguém está aceitando TCP no endereço de CHROME_URL.
+  • Garanta que o serviço do Chrome/Browserless (ex.: chrome-wa) está **rodando** e **healthy**.
+  • No Easypanel, coloque este app e o Chrome na **mesma rede** interna (alias DNS tipo chrome-wa).
+  • Confira a **porta**: muitas imagens Browserless expõem WebSocket na **3000**; Chrome “cru” (CDP) costuma ser **9222**.
+  • Se o Chrome sobe mais devagar, use STARTUP_WAIT_MS=30000 (milissegundos antes da 1ª tentativa).`);
+    }
+}
+
 console.log('Iniciando conexão com o Chrome em:', process.env.CHROME_URL);
+if (STARTUP_WAIT_MS) {
+    console.log(`⏳ STARTUP_WAIT_MS=${STARTUP_WAIT_MS} — aguardando antes do 1º connect...`);
+}
 
 if (!process.env.CHROME_URL) {
     console.error('❌ Defina a variável CHROME_URL (browserWSEndpoint do Browseless).');
@@ -40,6 +62,7 @@ const client = new Client({
 let pupGuardsBound = false;
 let reconnectBusy = false;
 let reconnectTimer = null;
+let pendingStartupWait = STARTUP_WAIT_MS > 0;
 
 function bindPuppeteerGuardsOnce() {
     if (pupGuardsBound || !client.pupPage) return;
@@ -55,7 +78,7 @@ function bindPuppeteerGuardsOnce() {
     if (client.pupBrowser) {
         client.pupBrowser.on('disconnected', () => {
             console.error('⚠️ Puppeteer: sessão com o Chrome remoto encerrada');
-            scheduleReconnect(8000);
+            scheduleReconnect(Math.min(8000, CHROME_RECONNECT_MS));
         });
     }
 }
@@ -69,7 +92,7 @@ async function destroyQuietly() {
     }
 }
 
-function scheduleReconnect(delayMs = 15000) {
+function scheduleReconnect(delayMs = CHROME_RECONNECT_MS) {
     if (reconnectTimer) return;
     console.log(`↻ Nova tentativa em ${Math.round(delayMs / 1000)}s...`);
     reconnectTimer = setTimeout(async () => {
@@ -87,11 +110,15 @@ function scheduleReconnect(delayMs = 15000) {
 
 async function start() {
     try {
+        if (pendingStartupWait) {
+            pendingStartupWait = false;
+            await sleep(STARTUP_WAIT_MS);
+        }
         await client.initialize();
         bindPuppeteerGuardsOnce();
     } catch (err) {
-        console.error('❌ Falha ao inicializar o cliente:', err?.message || err);
-        scheduleReconnect(15000);
+        explainInitError(err);
+        scheduleReconnect(CHROME_RECONNECT_MS);
     }
 }
 
@@ -116,7 +143,7 @@ client.on('auth_failure', (msg) => {
 
 client.on('disconnected', (reason) => {
     console.error('❌ WhatsApp desconectado:', reason);
-    scheduleReconnect(10000);
+    scheduleReconnect(Math.min(10000, CHROME_RECONNECT_MS));
 });
 
 client.on('message', async (msg) => {
