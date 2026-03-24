@@ -8,7 +8,7 @@
     "qrcode-terminal": "^0.12.0"
   },
   "scripts": {
-    "start": "node index.js",
+    "start": "node --unhandled-rejections=warn index.js",
     "deploy:easypanel": "curl -fsS \"http://3.210.217.206:3000/api/deploy/a96e87363ff57ad331f34ed41b8ace4fa53a85c7b7beb2d1\""
   }
 }
