@@ -106,6 +106,11 @@ if (STARTUP_WAIT_MS) {
     console.log(`⏳ STARTUP_WAIT_MS=${STARTUP_WAIT_MS} — aguardando antes do 1º connect...`);
 }
 
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
+if (!N8N_WEBHOOK_URL) {
+    console.error('❌ Defina a variável N8N_WEBHOOK_URL (URL completa do Webhook no n8n).');
+}
+
 if (!process.env.CHROME_URL) {
     console.error('❌ Defina a variável CHROME_URL (browserWSEndpoint do Browseless).');
     process.exit(1);
@@ -236,7 +241,7 @@ client.on('message', async (msg) => {
     try {
         const bodyPreview = msg.body ? String(msg.body).slice(0, 120) : '';
         console.log(`↪ Mensagem de ${msg.from} (type=${msg.type}) id=${messageKey || 'n/a'}: ${bodyPreview}`);
-        await axios.post(process.env.N8N_WEBHOOK_URL, {
+        await axios.post(N8N_WEBHOOK_URL, {
             event: 'message.upsert',
             from: msg.from,
             body: msg.body,
@@ -246,7 +251,18 @@ client.on('message', async (msg) => {
             messageType: msg.type
         });
     } catch (err) {
-        console.error('❌ Erro ao enviar para o n8n:', err.message);
+        const status = err?.response?.status;
+        const respData = err?.response?.data;
+        const respText = typeof respData === 'string' ? respData : JSON.stringify(respData || {});
+        const respPreview = respText.slice(0, 400);
+        console.error(
+            '❌ Erro ao enviar para o n8n:',
+            `status=${status || 'n/a'}`,
+            `url=${N8N_WEBHOOK_URL}`,
+            'msg=',
+            err?.message || String(err),
+            respPreview ? `resp=${respPreview}` : ''
+        );
     }
 });
 
