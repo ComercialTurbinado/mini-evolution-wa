@@ -13,12 +13,25 @@ process.on('uncaughtException', (err) => {
     console.error('⚠️ Exceção não capturada:', err?.stack || err);
 });
 
-const { Client } = require('whatsapp-web.js');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const axios = require('axios');
 const qrcode = require('qrcode-terminal');
+const http = require('http');
 
 const STARTUP_WAIT_MS = Math.max(0, parseInt(process.env.STARTUP_WAIT_MS || '0', 10) || 0);
 const CHROME_RECONNECT_MS = Math.max(3000, parseInt(process.env.CHROME_RECONNECT_MS || '15000', 10) || 15000);
+const CHROME_RECONNECT_MAX_MS = Math.max(
+    CHROME_RECONNECT_MS,
+    parseInt(process.env.CHROME_RECONNECT_MAX_MS || '60000', 10) || 60000
+);
+const WWEB_AUTH_DATA_PATH = process.env.WWEB_AUTH_DATA_PATH || '/app/.wwebjs_auth';
+const ENABLE_MEDIA_FORWARDING = !['0', 'false', 'no'].includes(
+    String(process.env.ENABLE_MEDIA_FORWARDING || 'true').toLowerCase()
+);
+const MAX_MEDIA_BASE64_CHARS = Math.max(
+    10000,
+    parseInt(process.env.MAX_MEDIA_BASE64_CHARS || '6000000', 10) || 6000000
+); // ~6MB base64 (JSON grande). Ajuste se necessário.
 const MESSAGE_DEDUP_TTL_MS = Math.max(
     1000,
     parseInt(process.env.MESSAGE_DEDUP_TTL_MS || '300000', 10) || 300000
@@ -119,6 +132,8 @@ if (!process.env.CHROME_URL) {
 }
 
 const client = new Client({
+    // Persistir sessão evita precisar reconectar (QR) a cada reinício do container.
+    authStrategy: new LocalAuth({ dataPath: WWEB_AUTH_DATA_PATH }),
     puppeteer: {
         browserWSEndpoint: process.env.CHROME_URL,
         headless: true,
@@ -135,6 +150,40 @@ let pupGuardsBound = false;
 let reconnectBusy = false;
 let reconnectTimer = null;
 let pendingStartupWait = STARTUP_WAIT_MS > 0;
+let healthServer = null;
+let healthServers = [];
+let reconnectAttempt = 0;
+
+function startHealthServer() {
+    if (String(process.env.DISABLE_HEALTH_SERVER || '').toLowerCase() === 'true') return;
+    const ports = new Set();
+    const envPort = parseInt(process.env.PORT || '', 10);
+    ports.add(Number.isFinite(envPort) ? envPort : 3000);
+    ports.add(3000);
+    ports.add(8080);
+
+    const handler = (req, res) => {
+        if (req.url === '/' || req.url === '/health' || req.url === '/healthz') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, service: 'mini-evolution-wa' }));
+            return;
+        }
+        res.writeHead(404);
+        res.end();
+    };
+
+    for (const port of ports) {
+        try {
+            const srv = http.createServer(handler);
+            srv.listen(port, '0.0.0.0', () => {
+                console.log(`🌐 Health server listening on :${port}`);
+            });
+            healthServers.push(srv);
+        } catch (_) {
+            // Ignora falhas ao bind (porta em uso etc.)
+        }
+    }
+}
 
 function bindPuppeteerGuardsOnce() {
     if (pupGuardsBound || !client.pupPage) return;
@@ -164,9 +213,61 @@ async function destroyQuietly() {
     }
 }
 
+process.on('SIGTERM', async () => {
+    console.error('↯ SIGTERM recebido. Encerrando com segurança...');
+    try {
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        for (const srv of healthServers) {
+            try {
+                srv.close();
+            } catch (_) {
+                /* ignore */
+            }
+        }
+    } catch (_) {
+        /* ignore */
+    }
+    try {
+        await destroyQuietly();
+    } catch (_) {
+        /* ignore */
+    }
+    process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+    console.error('↯ SIGINT recebido. Encerrando com segurança...');
+    try {
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        for (const srv of healthServers) {
+            try {
+                srv.close();
+            } catch (_) {
+                /* ignore */
+            }
+        }
+    } catch (_) {
+        /* ignore */
+    }
+    try {
+        await destroyQuietly();
+    } catch (_) {
+        /* ignore */
+    }
+    process.exit(0);
+});
+
 function scheduleReconnect(delayMs = CHROME_RECONNECT_MS) {
     if (reconnectTimer) return;
-    console.log(`↻ Nova tentativa em ${Math.round(delayMs / 1000)}s...`);
+    reconnectAttempt += 1;
+    const jitter = Math.round(delayMs * 0.2 * Math.random());
+    const expBackoff = delayMs * Math.pow(2, reconnectAttempt - 1);
+    const finalDelay = Math.min(CHROME_RECONNECT_MAX_MS, expBackoff + jitter);
+    console.log(
+        `↻ Reconnect scheduled (attempt=${reconnectAttempt}) em ${Math.round(finalDelay / 1000)}s...`
+    );
     reconnectTimer = setTimeout(async () => {
         reconnectTimer = null;
         if (reconnectBusy) return;
@@ -177,7 +278,7 @@ function scheduleReconnect(delayMs = CHROME_RECONNECT_MS) {
         } finally {
             reconnectBusy = false;
         }
-    }, delayMs);
+    }, finalDelay);
 }
 
 async function start() {
@@ -187,6 +288,8 @@ async function start() {
             await sleep(STARTUP_WAIT_MS);
         }
         await client.initialize();
+        // Se inicializou, zera tentativas: a conexão está indo pra "ok".
+        reconnectAttempt = 0;
         bindPuppeteerGuardsOnce();
     } catch (err) {
         explainInitError(err);
@@ -207,6 +310,7 @@ client.on('authenticated', () => {
 client.on('ready', () => {
     bindPuppeteerGuardsOnce();
     console.log('✅ WhatsApp Conectado!');
+    reconnectAttempt = 0;
 });
 
 client.on('auth_failure', (msg) => {
@@ -235,7 +339,7 @@ client.on('message', async (msg) => {
         return;
     }
 
-    if (!FORWARD_EMPTY_BODY && (!msg.body || String(msg.body).trim().length === 0)) {
+    if (!FORWARD_EMPTY_BODY && !msg.hasMedia && (!msg.body || String(msg.body).trim().length === 0)) {
         if (DEBUG_LOG_MESSAGES) console.log(`⏭️ Corpo vazio ignorado. id=${messageKey}`);
         return;
     }
@@ -243,6 +347,28 @@ client.on('message', async (msg) => {
     try {
         const bodyPreview = msg.body ? String(msg.body).slice(0, 120) : '';
         console.log(`↪ Mensagem de ${msg.from} (type=${msg.type}) id=${messageKey || 'n/a'}: ${bodyPreview}`);
+
+        let media = null;
+        if (ENABLE_MEDIA_FORWARDING && msg.hasMedia) {
+            try {
+                const downloaded = await msg.downloadMedia();
+                const dataLen = downloaded?.data ? String(downloaded.data).length : 0;
+                if (dataLen > MAX_MEDIA_BASE64_CHARS) {
+                    console.error(
+                        `⚠️ Mídia grande demais para enviar (base64 chars=${dataLen}). Ajuste MAX_MEDIA_BASE64_CHARS se quiser.`
+                    );
+                } else {
+                    media = {
+                        mimetype: downloaded?.mimetype,
+                        filename: downloaded?.filename,
+                        data: downloaded?.data
+                    };
+                }
+            } catch (e) {
+                console.error('⚠️ Falha ao baixar mídia do WhatsApp:', e?.message || e);
+            }
+        }
+
         await axios.post(N8N_WEBHOOK_URL, {
             event: 'message.upsert',
             from: msg.from,
@@ -250,7 +376,9 @@ client.on('message', async (msg) => {
             name: msg._data?.notifyName || 'Contato',
             timestamp: msg.timestamp,
             messageId: messageKey,
-            messageType: msg.type
+            messageType: msg.type,
+            hasMedia: Boolean(msg.hasMedia),
+            media
         });
     } catch (err) {
         const status = err?.response?.status;
@@ -268,4 +396,5 @@ client.on('message', async (msg) => {
     }
 });
 
+startHealthServer();
 start();
