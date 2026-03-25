@@ -19,6 +19,44 @@ const qrcode = require('qrcode-terminal');
 
 const STARTUP_WAIT_MS = Math.max(0, parseInt(process.env.STARTUP_WAIT_MS || '0', 10) || 0);
 const CHROME_RECONNECT_MS = Math.max(3000, parseInt(process.env.CHROME_RECONNECT_MS || '15000', 10) || 15000);
+const MESSAGE_DEDUP_TTL_MS = Math.max(
+    1000,
+    parseInt(process.env.MESSAGE_DEDUP_TTL_MS || '300000', 10) || 300000
+); // 5 min padrão
+const MAX_RECENT_MESSAGES = Math.max(1000, parseInt(process.env.MAX_RECENT_MESSAGES || '10000', 10) || 10000);
+const DEBUG_LOG_MESSAGES = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_LOG_MESSAGES || '').toLowerCase());
+const FORWARD_EMPTY_BODY = ['1', 'true', 'yes'].includes(String(process.env.FORWARD_EMPTY_BODY || '').toLowerCase());
+
+// Deduplicação em memória (evita disparos repetidos do mesmo messageId)
+const recentMessages = new Map(); // messageKey -> lastSeenAtMs
+
+function getMessageKey(msg) {
+    // whatsapp-web.js Message.id geralmente tem _serialized
+    const key = msg?.id?._serialized;
+    if (typeof key === 'string' && key.length > 0) return key;
+    // fallback
+    const rawId = msg?.id;
+    try {
+        return rawId ? JSON.stringify(rawId) : undefined;
+    } catch (_) {
+        return undefined;
+    }
+}
+
+function isDuplicateAndMark(messageKey) {
+    const now = Date.now();
+    const prev = recentMessages.get(messageKey);
+    if (prev && now - prev < MESSAGE_DEDUP_TTL_MS) return true;
+    recentMessages.set(messageKey, now);
+
+    if (recentMessages.size > MAX_RECENT_MESSAGES) {
+        // poda simples baseada no TTL
+        for (const [k, t] of recentMessages.entries()) {
+            if (now - t >= MESSAGE_DEDUP_TTL_MS) recentMessages.delete(k);
+        }
+    }
+    return false;
+}
 
 function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
@@ -148,15 +186,31 @@ client.on('disconnected', (reason) => {
 
 client.on('message', async (msg) => {
     if (msg.from === 'status@broadcast') return;
+    // Evita loop caso o n8n envie mensagens de volta por esta mesma sessão.
+    if (msg.fromMe) return;
+
+    const messageKey = getMessageKey(msg);
+    if (messageKey && isDuplicateAndMark(messageKey)) {
+        if (DEBUG_LOG_MESSAGES) console.log(`⏭️ Duplicado ignorado: ${messageKey}`);
+        return;
+    }
+
+    if (!FORWARD_EMPTY_BODY && (!msg.body || String(msg.body).trim().length === 0)) {
+        if (DEBUG_LOG_MESSAGES) console.log(`⏭️ Corpo vazio ignorado. id=${messageKey}`);
+        return;
+    }
 
     try {
-        console.log(`Mensagem de ${msg.from}: ${msg.body}`);
+        const bodyPreview = msg.body ? String(msg.body).slice(0, 120) : '';
+        console.log(`↪ Mensagem de ${msg.from} (type=${msg.type}) id=${messageKey || 'n/a'}: ${bodyPreview}`);
         await axios.post(process.env.N8N_WEBHOOK_URL, {
             event: 'message.upsert',
             from: msg.from,
             body: msg.body,
-            name: msg._data.notifyName || 'Contato',
-            timestamp: msg.timestamp
+            name: msg._data?.notifyName || 'Contato',
+            timestamp: msg.timestamp,
+            messageId: messageKey,
+            messageType: msg.type
         });
     } catch (err) {
         console.error('❌ Erro ao enviar para o n8n:', err.message);
