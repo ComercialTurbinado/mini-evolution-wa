@@ -33,6 +33,7 @@ const recentContentMessages = new Map(); // contentKey -> lastSeenAtMs
 
 const CONTENT_DEDUP_TTL_MS = Math.max(1000, parseInt(process.env.CONTENT_DEDUP_TTL_MS || '15000', 10) || 15000); // 15s por conteúdo
 const MAX_RECENT_CONTENT_KEYS = Math.max(1000, parseInt(process.env.MAX_RECENT_CONTENT_KEYS || '5000', 10) || 5000);
+const TS_BUCKET_SECONDS = Math.max(1, parseInt(process.env.TS_BUCKET_SECONDS || '10', 10) || 10);
 
 function getMessageKey(msg) {
     // whatsapp-web.js Message.id geralmente tem _serialized
@@ -65,10 +66,11 @@ function isDuplicateAndMark(messageKey) {
 function getContentKey(msg) {
     const from = msg?.from || '';
     const type = msg?.type || '';
-    const ts = msg?.timestamp || '';
+    const tsNum = typeof msg?.timestamp === 'number' ? msg.timestamp : parseInt(String(msg?.timestamp || ''), 10);
+    const tsBucket = Number.isFinite(tsNum) ? Math.floor(tsNum / TS_BUCKET_SECONDS) : '';
     const body = msg?.body ? String(msg.body).trim().replace(/\s+/g, ' ').slice(0, 200) : '';
-    // Quando o messageId vem "diferente" em duplicatas, essa chave costuma estabilizar (from+type+timestamp+conteudo).
-    return `${from}|${type}|${ts}|${body}`;
+    // O timestamp do WA pode variar entre eventos repetidos; "bucket" estabiliza a chave em rajadas.
+    return `${from}|${type}|${tsBucket}|${body}`;
 }
 
 function isDuplicateContentAndMark(contentKey) {
