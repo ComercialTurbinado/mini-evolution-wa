@@ -29,6 +29,10 @@ const FORWARD_EMPTY_BODY = ['1', 'true', 'yes'].includes(String(process.env.FORW
 
 // Deduplicação em memória (evita disparos repetidos do mesmo messageId)
 const recentMessages = new Map(); // messageKey -> lastSeenAtMs
+const recentContentMessages = new Map(); // contentKey -> lastSeenAtMs
+
+const CONTENT_DEDUP_TTL_MS = Math.max(1000, parseInt(process.env.CONTENT_DEDUP_TTL_MS || '15000', 10) || 15000); // 15s por conteúdo
+const MAX_RECENT_CONTENT_KEYS = Math.max(1000, parseInt(process.env.MAX_RECENT_CONTENT_KEYS || '5000', 10) || 5000);
 
 function getMessageKey(msg) {
     // whatsapp-web.js Message.id geralmente tem _serialized
@@ -53,6 +57,29 @@ function isDuplicateAndMark(messageKey) {
         // poda simples baseada no TTL
         for (const [k, t] of recentMessages.entries()) {
             if (now - t >= MESSAGE_DEDUP_TTL_MS) recentMessages.delete(k);
+        }
+    }
+    return false;
+}
+
+function getContentKey(msg) {
+    const from = msg?.from || '';
+    const type = msg?.type || '';
+    const ts = msg?.timestamp || '';
+    const body = msg?.body ? String(msg.body).trim().replace(/\s+/g, ' ').slice(0, 200) : '';
+    // Quando o messageId vem "diferente" em duplicatas, essa chave costuma estabilizar (from+type+timestamp+conteudo).
+    return `${from}|${type}|${ts}|${body}`;
+}
+
+function isDuplicateContentAndMark(contentKey) {
+    const now = Date.now();
+    const prev = recentContentMessages.get(contentKey);
+    if (prev && now - prev < CONTENT_DEDUP_TTL_MS) return true;
+    recentContentMessages.set(contentKey, now);
+
+    if (recentContentMessages.size > MAX_RECENT_CONTENT_KEYS) {
+        for (const [k, t] of recentContentMessages.entries()) {
+            if (now - t >= CONTENT_DEDUP_TTL_MS) recentContentMessages.delete(k);
         }
     }
     return false;
@@ -192,6 +219,12 @@ client.on('message', async (msg) => {
     const messageKey = getMessageKey(msg);
     if (messageKey && isDuplicateAndMark(messageKey)) {
         if (DEBUG_LOG_MESSAGES) console.log(`⏭️ Duplicado ignorado: ${messageKey}`);
+        return;
+    }
+
+    const contentKey = getContentKey(msg);
+    if (contentKey && isDuplicateContentAndMark(contentKey)) {
+        if (DEBUG_LOG_MESSAGES) console.log(`⏭️ Duplicado por conteúdo ignorado: ${contentKey}`);
         return;
     }
 
